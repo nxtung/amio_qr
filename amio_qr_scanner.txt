@@ -1,0 +1,2223 @@
+# Triển khai `amio_qr_scanner` – Native QR Scanner cho AMIO
+
+Với lựa chọn này, chúng ta sẽ xây dựng một Flutter plugin thực sự, không phụ thuộc `mobile_scanner`, không sử dụng `camera` package hay Provider.
+
+Kiến trúc triển khai:
+
+- Android: Kotlin + CameraX + Google ML Kit Barcode Scanning.
+- iOS: Swift + AVFoundation + Vision Framework.
+- Flutter: Dart API + MethodChannel + EventChannel.
+- UI: Flutter Widget tự xây dựng, có scan overlay, animation, flash và chuyển camera.
+- Chỉ nhận diện QR Code, không xử lý barcode khác.
+
+## amio_qr_scanner
+
+Native implementation
+
+Android
+
+CameraX + ML Kit
+
+iOS
+
+AVFoundation + Vision
+
+Flutter
+
+Dart controller + widgets
+
+QR only
+
+Realtime detection
+
+## 1. Cấu trúc source code
+
+```
+amio_qr_scanner/
+├── pubspec.yaml
+├── README.md
+├── CHANGELOG.md
+│
+├── lib/
+│   ├── amio_qr_scanner.dart
+│   └── src/
+│       ├── controller/
+│       │   └── qr_scanner_controller.dart
+│       ├── models/
+│       │   ├── qr_scan_result.dart
+│       │   ├── qr_scanner_config.dart
+│       │   └── qr_scanner_state.dart
+│       ├── platform/
+│       │   └── qr_scanner_platform.dart
+│       └── widgets/
+│           ├── qr_scanner_view.dart
+│           ├── qr_scanner_overlay.dart
+│           └── qr_scanner_animation.dart
+│
+├── android/
+│   ├── build.gradle.kts
+│   └── src/main/
+│       ├── AndroidManifest.xml
+│       └── kotlin/vn/com/dgx/amio_qr_scanner/
+│           ├── AmioQrScannerPlugin.kt
+│           └── QrCameraManager.kt
+│
+├── ios/
+│   ├── amio_qr_scanner.podspec
+│   └── Classes/
+│       ├── AmioQrScannerPlugin.swift
+│       └── QrCameraManager.swift
+│
+└── example/
+    └── lib/main.dart
+```
+
+Kiến trúc này tách biệt phần camera native, giao tiếp platform và giao diện Flutter. Sau này có thể thay đổi UI mà không phải sửa engine nhận diện QR.
+
+## 2. Khởi tạo package
+
+Tạo plugin:
+
+```
+flutter create \
+  --template=plugin \
+  --platforms=android,ios \
+  --org=vn.com.dgx \
+  amio_qr_scanner
+```
+
+### `pubspec.yaml`
+
+```
+name: amio_qr_scanner
+description: Native QR code scanner for AMIO.
+version: 1.0.0
+
+environment:
+  sdk: '>=3.5.0 <4.0.0'
+  flutter: '>=3.24.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  plugin:
+    platforms:
+      android:
+        package: vn.com.dgx.amio_qr_scanner
+        pluginClass: AmioQrScannerPlugin
+      ios:
+        pluginClass: AmioQrScannerPlugin
+```
+
+Không có dependency Flutter bên ngoài. Phần camera và QR recognition đều được xử lý native.
+
+### Luồng xử lý
+
+Flutter QRScannerView
+
+Preview container + custom overlay
+
+PlatformView + MethodChannel + EventChannel
+
+Android
+
+- CameraX Preview
+- ImageAnalysis
+- ML Kit QR
+
+iOS
+
+- AVCaptureSession
+- Video output
+- Vision QR
+
+QRScanResult
+
+value, timestamp, boundingBox
+
+Tôi chọn `PlatformView` thay vì truyền từng frame camera qua EventChannel. Camera preview sẽ được render trực tiếp trên native view; EventChannel chỉ gửi kết quả nhận diện. Điều này tránh việc chuyển hàng chục frame mỗi giây qua Flutter.
+
+## 3. Dart implementation
+
+### 3.1. `qr_scan_result.dart`
+
+```
+class QRScanResult {
+  final String value;
+  final DateTime timestamp;
+
+  /// Bounding box normalized to 0.0 - 1.0.
+  final double left;
+  final double top;
+  final double width;
+  final double height;
+
+  const QRScanResult({
+    required this.value,
+    required this.timestamp,
+    this.left = 0,
+    this.top = 0,
+    this.width = 0,
+    this.height = 0,
+  });
+
+  factory QRScanResult.fromMap(Map<dynamic, dynamic> map) {
+    return QRScanResult(
+      value: map['value'] as String,
+      timestamp: DateTime.fromMillisecondsSinceEpoch(
+        (map['timestamp'] as num).toInt(),
+      ),
+      left: (map['left'] as num?)?.toDouble() ?? 0,
+      top: (map['top'] as num?)?.toDouble() ?? 0,
+      width: (map['width'] as num?)?.toDouble() ?? 0,
+      height: (map['height'] as num?)?.toDouble() ?? 0,
+    );
+  }
+}
+```
+
+### 3.2. `qr_scanner_config.dart`
+
+```
+enum QrCameraFacing {
+  back,
+  front,
+}
+
+class QrScannerConfig {
+  final QrCameraFacing cameraFacing;
+  final bool enableFlash;
+  final bool showOverlay;
+  final bool showAnimation;
+  final double scanWindowSize;
+  final Duration detectionTimeout;
+  final Duration duplicateTimeout;
+
+  const QrScannerConfig({
+    this.cameraFacing = QrCameraFacing.back,
+    this.enableFlash = false,
+    this.showOverlay = true,
+    this.showAnimation = true,
+    this.scanWindowSize = 260,
+    this.detectionTimeout = const Duration(milliseconds: 250),
+    this.duplicateTimeout = const Duration(seconds: 2),
+  });
+}
+```
+
+### 3.3. `qr_scanner_state.dart`
+
+```
+enum QrScannerStatus {
+  initial,
+  initializing,
+  running,
+  paused,
+  stopped,
+  error,
+}
+
+class QrScannerState {
+  final QrScannerStatus status;
+  final bool hasPermission;
+  final bool isFlashOn;
+  final QrCameraFacing cameraFacing;
+  final String? error;
+
+  const QrScannerState({
+    this.status = QrScannerStatus.initial,
+    this.hasPermission = false,
+    this.isFlashOn = false,
+    this.cameraFacing = QrCameraFacing.back,
+    this.error,
+  });
+
+  QrScannerState copyWith({
+    QrScannerStatus? status,
+    bool? hasPermission,
+    bool? isFlashOn,
+    QrCameraFacing? cameraFacing,
+    String? error,
+  }) {
+    return QrScannerState(
+      status: status ?? this.status,
+      hasPermission: hasPermission ?? this.hasPermission,
+      isFlashOn: isFlashOn ?? this.isFlashOn,
+      cameraFacing: cameraFacing ?? this.cameraFacing,
+      error: error,
+    );
+  }
+}
+```
+
+### 3.4. `qr_scanner_controller.dart`
+
+Controller quản lý trạng thái, native commands, stream kết quả và chống nhận QR trùng.
+
+```
+import 'dart:async';
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
+
+import '../models/qr_scan_result.dart';
+import '../models/qr_scanner_config.dart';
+import '../models/qr_scanner_state.dart';
+
+class QrScannerController extends ChangeNotifier {
+  QrScannerController({
+    this.config = const QrScannerConfig(),
+  });
+
+  final QrScannerConfig config;
+
+  QrScannerState _state = const QrScannerState();
+
+  QrScannerState get state => _state;
+
+  int? _viewId;
+  MethodChannel? _methodChannel;
+  EventChannel? _eventChannel;
+
+  StreamSubscription<dynamic>? _subscription;
+
+  final _resultController =
+      StreamController<QRScanResult>.broadcast();
+
+  Stream<QRScanResult> get results => _resultController.stream;
+
+  String? _lastValue;
+  DateTime? _lastDetectedAt;
+
+  bool _disposed = false;
+
+  void _update(QrScannerState state) {
+    if (_disposed) return;
+    _state = state;
+    notifyListeners();
+  }
+
+  void attach(int viewId) {
+    _viewId = viewId;
+
+    _methodChannel = MethodChannel(
+      'vn.com.dgx/amio_qr_scanner/methods_$viewId',
+    );
+
+    _eventChannel = EventChannel(
+      'vn.com.dgx/amio_qr_scanner/events_$viewId',
+    );
+
+    _subscription = _eventChannel!.receiveBroadcastStream().listen(
+      _handleEvent,
+      onError: (Object error) {
+        _update(_state.copyWith(
+          status: QrScannerStatus.error,
+          error: error.toString(),
+        ));
+      },
+    );
+  }
+
+  void _handleEvent(dynamic event) {
+    if (event is! Map) return;
+
+    final type = event['type'];
+
+    if (type == 'result') {
+      final result = QRScanResult.fromMap(event);
+
+      final now = DateTime.now();
+
+      if (_lastValue == result.value &&
+          _lastDetectedAt != null &&
+          now.difference(_lastDetectedAt!) <
+              config.duplicateTimeout) {
+        return;
+      }
+
+      _lastValue = result.value;
+      _lastDetectedAt = now;
+
+      _resultController.add(result);
+    }
+
+    if (type == 'error') {
+      _update(_state.copyWith(
+        status: QrScannerStatus.error,
+        error: event['message']?.toString(),
+      ));
+    }
+  }
+
+  Future<T?> _invoke<T>(
+    String method, [
+    Map<String, dynamic>? arguments,
+  ]) async {
+    final channel = _methodChannel;
+    if (channel == null || _disposed) return null;
+
+    return channel.invokeMethod<T>(method, arguments);
+  }
+
+  Future<bool> requestPermission() async {
+    final granted = await _invoke<bool>('requestPermission') ?? false;
+
+    _update(_state.copyWith(
+      hasPermission: granted,
+    ));
+
+    return granted;
+  }
+
+  Future<void> start() async {
+    _update(_state.copyWith(
+      status: QrScannerStatus.initializing,
+    ));
+
+    final granted = await requestPermission();
+
+    if (!granted) {
+      _update(_state.copyWith(
+        status: QrScannerStatus.error,
+        error: 'Camera permission denied',
+      ));
+      return;
+    }
+
+    await _invoke('start', {
+      'cameraFacing': config.cameraFacing.name,
+      'enableFlash': config.enableFlash,
+      'detectionTimeout': config.detectionTimeout.inMilliseconds,
+      'scanWindowSize': config.scanWindowSize,
+    });
+
+    _update(_state.copyWith(
+      status: QrScannerStatus.running,
+      hasPermission: true,
+    ));
+  }
+
+  Future<void> stop() async {
+    await _invoke('stop');
+
+    _update(_state.copyWith(
+      status: QrScannerStatus.stopped,
+    ));
+  }
+
+  Future<void> pause() async {
+    await _invoke('pause');
+
+    _update(_state.copyWith(
+      status: QrScannerStatus.paused,
+    ));
+  }
+
+  Future<void> resume() async {
+    await start();
+  }
+
+  Future<void> toggleFlash() async {
+    final enabled = await _invoke<bool>('toggleFlash');
+
+    _update(_state.copyWith(
+      isFlashOn: enabled ?? false,
+    ));
+  }
+
+  Future<void> switchCamera() async {
+    final facing = await _invoke<String>('switchCamera');
+
+    if (facing == null) return;
+
+    _update(_state.copyWith(
+      cameraFacing: facing == 'front'
+          ? QrCameraFacing.front
+          : QrCameraFacing.back,
+      isFlashOn: false,
+    ));
+  }
+
+  Future<void> resetDetection() async {
+    _lastValue = null;
+    _lastDetectedAt = null;
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+
+    _subscription?.cancel();
+    _resultController.close();
+
+    _invoke('stop');
+
+    super.dispose();
+  }
+}
+```
+
+### 3.5. `qr_scanner_view.dart`
+
+Đây là widget kết hợp native preview và Flutter overlay.
+
+```
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+
+import '../controller/qr_scanner_controller.dart';
+import '../models/qr_scanner_config.dart';
+import 'qr_scanner_overlay.dart';
+
+class QrScannerView extends StatefulWidget {
+  const QrScannerView({
+    super.key,
+    required this.controller,
+    this.onDetect,
+    this.onError,
+    this.overlayColor = Colors.black54,
+    this.scanLineColor = const Color(0xFFF26F25),
+  });
+
+  final QrScannerController controller;
+  final ValueChanged<dynamic>? onDetect;
+  final ValueChanged<String>? onError;
+  final Color overlayColor;
+  final Color scanLineColor;
+
+  @override
+  State<QrScannerView> createState() => _QrScannerViewState();
+}
+
+class _QrScannerViewState extends State<QrScannerView>
+    with WidgetsBindingObserver {
+  @override
+  void initState() {
+    super.initState();
+
+    WidgetsBinding.instance.addObserver(this);
+
+    widget.controller.results.listen((result) {
+      if (mounted) widget.onDetect?.call(result);
+    });
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    switch (state) {
+      case AppLifecycleState.inactive:
+      case AppLifecycleState.paused:
+      case AppLifecycleState.detached:
+        widget.controller.pause();
+        break;
+      case AppLifecycleState.resumed:
+        widget.controller.resume();
+        break;
+      case AppLifecycleState.hidden:
+        widget.controller.pause();
+        break;
+    }
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    const viewType = 'vn.com.dgx/amio_qr_scanner/view';
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        return Stack(
+          fit: StackFit.expand,
+          children: [
+            if (Theme.of(context).platform == TargetPlatform.android)
+              AndroidView(
+                viewType: viewType,
+                creationParams: const {},
+                creationParamsCodec: const StandardMessageCodec(),
+                onPlatformViewCreated: widget.controller.attach,
+              )
+            else if (Theme.of(context).platform == TargetPlatform.iOS)
+              UiKitView(
+                viewType: viewType,
+                creationParams: const {},
+                creationParamsCodec: const StandardMessageCodec(),
+                onPlatformViewCreated: widget.controller.attach,
+              )
+            else
+              const Center(
+                child: Text('Platform not supported'),
+              ),
+            if (widget.controller.config.showOverlay)
+              QrScannerOverlay(
+                color: widget.overlayColor,
+                scanLineColor: widget.scanLineColor,
+                animated: widget.controller.config.showAnimation,
+                windowSize: widget.controller.config.scanWindowSize,
+              ),
+          ],
+        );
+      },
+    );
+  }
+}
+```
+
+Lưu ý: trong ứng dụng thực tế nên quản lý subscription của widget bằng `StreamSubscription` và hủy trong `dispose`, thay vì đăng ký listener không được giữ lại như đoạn minh họa trên.
+
+### 3.6. `qr_scanner_overlay.dart`
+
+```
+import 'package:flutter/material.dart';
+
+class QrScannerOverlay extends StatefulWidget {
+  const QrScannerOverlay({
+    super.key,
+    this.color = Colors.black54,
+    this.scanLineColor = const Color(0xFFF26F25),
+    this.windowSize = 260,
+    this.animated = true,
+  });
+
+  final Color color;
+  final Color scanLineColor;
+  final double windowSize;
+  final bool animated;
+
+  @override
+  State<QrScannerOverlay> createState() =>
+      _QrScannerOverlayState();
+}
+
+class _QrScannerOverlayState extends State<QrScannerOverlay>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _animation;
+
+  @override
+  void initState() {
+    super.initState();
+
+    _animation = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1800),
+    );
+
+    if (widget.animated) {
+      _animation.repeat(reverse: true);
+    }
+  }
+
+  @override
+  void dispose() {
+    _animation.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final size = widget.windowSize.clamp(
+          100.0,
+          constraints.biggest.shortestSide,
+        );
+
+        final left = (constraints.maxWidth - size) / 2;
+        final top = (constraints.maxHeight - size) / 2;
+
+        return Stack(
+          children: [
+            CustomPaint(
+              size: constraints.biggest,
+              painter: _OverlayPainter(
+                size: size,
+                color: widget.color,
+              ),
+            ),
+            Positioned(
+              left: left,
+              top: top,
+              width: size,
+              height: size,
+              child: AnimatedBuilder(
+                animation: _animation,
+                builder: (context, child) {
+                  return CustomPaint(
+                    painter: _CornerPainter(
+                      color: widget.scanLineColor,
+                      progress: _animation.value,
+                      animated: widget.animated,
+                    ),
+                  );
+                },
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+}
+
+class _OverlayPainter extends CustomPainter {
+  _OverlayPainter({
+    required this.size,
+    required this.color,
+  });
+
+  final double size;
+  final Color color;
+
+  @override
+  void paint(Canvas canvas, Size canvasSize) {
+    final rect = Rect.fromCenter(
+      center: canvasSize.center(Offset.zero),
+      width: size,
+      height: size,
+    );
+
+    final path = Path()
+      ..addRect(Offset.zero & canvasSize)
+      ..addRRect(
+        RRect.fromRectAndRadius(
+          rect,
+          const Radius.circular(16),
+        ),
+      )
+      ..fillType = PathFillType.evenOdd;
+
+    canvas.drawPath(
+      path,
+      Paint()..color = color,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _OverlayPainter oldDelegate) =>
+      size != oldDelegate.size || color != oldDelegate.color;
+}
+
+class _CornerPainter extends CustomPainter {
+  _CornerPainter({
+    required this.color,
+    required this.progress,
+    required this.animated,
+  });
+
+  final Color color;
+  final double progress;
+  final bool animated;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = color
+      ..strokeWidth = 4
+      ..strokeCap = StrokeCap.round
+      ..style = PaintingStyle.stroke;
+
+    const length = 30.0;
+    const radius = 16.0;
+
+    final path = Path();
+
+    path.moveTo(0, length);
+    path.lineTo(0, radius);
+    path.quadraticBezierTo(0, 0, radius, 0);
+    path.lineTo(length, 0);
+
+    path.moveTo(size.width - length, 0);
+    path.lineTo(size.width - radius, 0);
+    path.quadraticBezierTo(
+      size.width, 0, size.width, radius,
+    );
+    path.lineTo(size.width, length);
+
+    path.moveTo(0, size.height - length);
+    path.lineTo(0, size.height - radius);
+    path.quadraticBezierTo(
+      0, size.height, radius, size.height,
+    );
+    path.lineTo(length, size.height);
+
+    path.moveTo(size.width - length, size.height);
+    path.lineTo(size.width - radius, size.height);
+    path.quadraticBezierTo(
+      size.width, size.height,
+      size.width, size.height - radius,
+    );
+    path.lineTo(size.width, size.height - length);
+
+    canvas.drawPath(path, paint);
+
+    if (animated) {
+      final y = size.height * progress;
+
+      canvas.drawLine(
+        Offset(8, y),
+        Offset(size.width - 8, y),
+        Paint()
+          ..color = color.withValues(alpha: 0.85)
+          ..strokeWidth = 2,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _CornerPainter oldDelegate) =>
+      progress != oldDelegate.progress ||
+      color != oldDelegate.color ||
+      animated != oldDelegate.animated;
+}
+```
+
+## 4. Android native implementation
+
+### 4.1. `android/build.gradle.kts`
+
+```
+group = "vn.com.dgx.amio_qr_scanner"
+version = "1.0.0"
+
+plugins {
+    id("com.android.library")
+    id("org.jetbrains.kotlin.android")
+}
+
+android {
+    namespace = "vn.com.dgx.amio_qr_scanner"
+    compileSdk = 36
+
+    defaultConfig {
+        minSdk = 23
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+}
+
+dependencies {
+    val cameraX = "1.4.2"
+
+    implementation("androidx.camera:camera-core:$cameraX")
+    implementation("androidx.camera:camera-camera2:$cameraX")
+    implementation("androidx.camera:camera-lifecycle:$cameraX")
+    implementation("androidx.camera:camera-view:$cameraX")
+
+    // Bundled model: không cần tải model khi sử dụng lần đầu.
+    implementation("com.google.mlkit:barcode-scanning:17.3.0")
+}
+```
+
+Tôi chọn bundled ML Kit thay vì unbundled. Với ứng dụng tài chính như AMIO, việc scanner hoạt động ngay khi mở mà không phụ thuộc tải model là ưu tiên quan trọng. Đổi lại, APK/AAB sẽ tăng kích thước.&#x20;
+
+[image](https://www.google.com/s2/favicons?domain=https://developers.google.com\&sz=32)
+
+Google for Developers
+
+
+
+### 4.2. `AndroidManifest.xml`
+
+```
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.CAMERA"/>
+
+    <uses-feature
+        android:name="android.hardware.camera"
+        android:required="false"/>
+
+    <application/>
+</manifest>
+```
+
+### 4.3. `AmioQrScannerPlugin.kt`
+
+```
+package vn.com.dgx.amio_qr_scanner
+
+import android.app.Activity
+import android.content.pm.PackageManager
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import io.flutter.embedding.engine.plugins.FlutterPlugin
+import io.flutter.embedding.engine.plugins.activity.ActivityAware
+import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
+import io.flutter.plugin.common.MethodChannel
+import io.flutter.plugin.common.PluginRegistry
+import io.flutter.plugin.common.StandardMessageCodec
+import io.flutter.plugin.platform.PlatformViewFactory
+
+class AmioQrScannerPlugin :
+    FlutterPlugin,
+    ActivityAware,
+    PluginRegistry.RequestPermissionsResultListener {
+
+    private var activity: Activity? = null
+    private var permissionResult: MethodChannel.Result? = null
+
+    companion object {
+        const val VIEW_TYPE =
+            "vn.com.dgx/amio_qr_scanner/view"
+
+        const val PERMISSION_REQUEST = 9281
+    }
+
+    override fun onAttachedToEngine(
+        binding: FlutterPlugin.FlutterPluginBinding
+    ) {
+        binding.platformViewRegistry.registerViewFactory(
+            VIEW_TYPE,
+            QrScannerViewFactory(this)
+        )
+    }
+
+    fun requestCameraPermission(
+        result: MethodChannel.Result
+    ) {
+        val currentActivity = activity
+
+        if (currentActivity == null) {
+            result.error(
+                "NO_ACTIVITY",
+                "Activity is unavailable",
+                null
+            )
+            return
+        }
+
+        if (
+            ContextCompat.checkSelfPermission(
+                currentActivity,
+                android.Manifest.permission.CAMERA
+            ) == PackageManager.PERMISSION_GRANTED
+        ) {
+            result.success(true)
+            return
+        }
+
+        if (permissionResult != null) {
+            result.error(
+                "PERMISSION_PENDING",
+                "A permission request is already running",
+                null
+            )
+            return
+        }
+
+        permissionResult = result
+
+        ActivityCompat.requestPermissions(
+            currentActivity,
+            arrayOf(android.Manifest.permission.CAMERA),
+            PERMISSION_REQUEST
+        )
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ): Boolean {
+        if (requestCode != PERMISSION_REQUEST) return false
+
+        val granted =
+            grantResults.isNotEmpty() &&
+            grantResults[0] == PackageManager.PERMISSION_GRANTED
+
+        permissionResult?.success(granted)
+        permissionResult = null
+
+        return true
+    }
+
+    override fun onAttachedToActivity(
+        binding: ActivityPluginBinding
+    ) {
+        activity = binding.activity
+        binding.addRequestPermissionsResultListener(this)
+    }
+
+    override fun onDetachedFromActivityForConfigChanges() {
+        activity = null
+    }
+
+    override fun onReattachedToActivityForConfigChanges(
+        binding: ActivityPluginBinding
+    ) {
+        activity = binding.activity
+        binding.addRequestPermissionsResultListener(this)
+    }
+
+    override fun onDetachedFromActivity() {
+        activity = null
+    }
+
+    override fun onDetachedFromEngine(
+        binding: FlutterPlugin.FlutterPluginBinding
+    ) {
+        permissionResult?.error(
+            "PLUGIN_DETACHED",
+            "Plugin detached",
+            null
+        )
+        permissionResult = null
+    }
+}
+
+class QrScannerViewFactory(
+    private val plugin: AmioQrScannerPlugin
+) : PlatformViewFactory(StandardMessageCodec.INSTANCE) {
+
+    override fun create(
+        context: android.content.Context,
+        viewId: Int,
+        args: Any?
+    ): io.flutter.plugin.platform.PlatformView {
+        return QrCameraManager(
+            context,
+            viewId,
+            plugin
+        )
+    }
+}
+```
+
+### 4.4. `QrCameraManager.kt`
+
+Đây là phần quan trọng nhất của Android: preview camera và phân tích frame.
+
+```
+package vn.com.dgx.amio_qr_scanner
+
+import android.Manifest
+import android.content.Context
+import android.content.pm.PackageManager
+import android.view.View
+import androidx.camera.core.Camera
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageProxy
+import androidx.camera.core.Preview
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.LifecycleOwner
+import com.google.mlkit.vision.barcode.BarcodeScannerOptions
+import com.google.mlkit.vision.barcode.BarcodeScanning
+import com.google.mlkit.vision.barcode.common.Barcode
+import com.google.mlkit.vision.common.InputImage
+import io.flutter.plugin.common.EventChannel
+import io.flutter.plugin.common.MethodCall
+import io.flutter.plugin.common.MethodChannel
+import io.flutter.plugin.platform.PlatformView
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+
+class QrCameraManager(
+    private val context: Context,
+    private val viewId: Int,
+    private val plugin: AmioQrScannerPlugin
+) : PlatformView, MethodChannel.MethodCallHandler,
+    EventChannel.StreamHandler {
+
+    private val previewView = PreviewView(context)
+
+    private val methodChannel = MethodChannel(
+        QrEngine.messenger!!,
+        "vn.com.dgx/amio_qr_scanner/methods_$viewId"
+    )
+
+    private val eventChannel = EventChannel(
+        QrEngine.messenger!!,
+        "vn.com.dgx/amio_qr_scanner/events_$viewId"
+    )
+
+    private var eventSink: EventChannel.EventSink? = null
+
+    private var cameraProvider: ProcessCameraProvider? = null
+    private var camera: Camera? = null
+
+    private var facing = CameraSelector.LENS_FACING_BACK
+    private var flashEnabled = false
+
+    private var analysisExecutor: ExecutorService =
+        Executors.newSingleThreadExecutor()
+
+    private var scanner = BarcodeScanning.getClient(
+        BarcodeScannerOptions.Builder()
+            .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
+            .build()
+    )
+
+    private var processing = false
+    private var lastScanTime = 0L
+    private var detectionTimeout = 250L
+
+    init {
+        methodChannel.setMethodCallHandler(this)
+        eventChannel.setStreamHandler(this)
+
+        previewView.implementationMode =
+            PreviewView.ImplementationMode.COMPATIBLE
+    }
+
+    override fun getView(): View = previewView
+
+    override fun onListen(
+        arguments: Any?,
+        events: EventChannel.EventSink?
+    ) {
+        eventSink = events
+    }
+
+    override fun onCancel(arguments: Any?) {
+        eventSink = null
+    }
+
+    override fun onMethodCall(
+        call: MethodCall,
+        result: MethodChannel.Result
+    ) {
+        when (call.method) {
+            "requestPermission" -> {
+                plugin.requestCameraPermission(result)
+            }
+
+            "start" -> {
+                detectionTimeout =
+                    call.argument<Number>("detectionTimeout")
+                        ?.toLong() ?: 250L
+
+                facing =
+                    if (
+                        call.argument<String>("cameraFacing") == "front"
+                    ) {
+                        CameraSelector.LENS_FACING_FRONT
+                    } else {
+                        CameraSelector.LENS_FACING_BACK
+                    }
+
+                startCamera(result)
+            }
+
+            "stop" -> {
+                stopCamera()
+                result.success(null)
+            }
+
+            "pause" -> {
+                stopCamera()
+                result.success(null)
+            }
+
+            "toggleFlash" -> {
+                flashEnabled = !flashEnabled
+
+                if (facing == CameraSelector.LENS_FACING_BACK) {
+                    camera?.cameraControl?.enableTorch(flashEnabled)
+                } else {
+                    flashEnabled = false
+                }
+
+                result.success(flashEnabled)
+            }
+
+            "switchCamera" -> {
+                facing =
+                    if (facing == CameraSelector.LENS_FACING_BACK) {
+                        CameraSelector.LENS_FACING_FRONT
+                    } else {
+                        CameraSelector.LENS_FACING_BACK
+                    }
+
+                flashEnabled = false
+
+                startCamera(null)
+                result.success(
+                    if (facing == CameraSelector.LENS_FACING_FRONT)
+                        "front" else "back"
+                )
+            }
+
+            else -> result.notImplemented()
+        }
+    }
+
+    private fun startCamera(
+        result: MethodChannel.Result?
+    ) {
+        val activity = QrEngine.activity
+
+        if (activity == null) {
+            result?.error("NO_ACTIVITY", "Activity unavailable", null)
+            return
+        }
+
+        if (
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.CAMERA
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            result?.error(
+                "PERMISSION_DENIED",
+                "Camera permission not granted",
+                null
+            )
+            return
+        }
+
+        val future = ProcessCameraProvider.getInstance(context)
+
+        future.addListener({
+            try {
+                val provider = future.get()
+
+                cameraProvider = provider
+                provider.unbindAll()
+
+                val preview = Preview.Builder().build()
+                preview.setSurfaceProvider(
+                    previewView.surfaceProvider
+                )
+
+                val analysis = ImageAnalysis.Builder()
+                    .setBackpressureStrategy(
+                        ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST
+                    )
+                    .build()
+
+                analysis.setAnalyzer(analysisExecutor) { image ->
+                    analyze(image)
+                }
+
+                val selector = CameraSelector.Builder()
+                    .requireLensFacing(facing)
+                    .build()
+
+                camera = provider.bindToLifecycle(
+                    activity as LifecycleOwner,
+                    selector,
+                    preview,
+                    analysis
+                )
+
+                if (flashEnabled) {
+                    camera?.cameraControl?.enableTorch(true)
+                }
+
+                result?.success(null)
+
+            } catch (e: Exception) {
+                emitError(e.message ?: "Camera initialization failed")
+                result?.error("CAMERA_ERROR", e.message, null)
+            }
+        }, ContextCompat.getMainExecutor(context))
+    }
+
+    @androidx.annotation.OptIn(
+        androidx.camera.core.ExperimentalGetImage::class
+    )
+    private fun analyze(imageProxy: ImageProxy) {
+        val now = System.currentTimeMillis()
+
+        if (
+            processing ||
+            now - lastScanTime < detectionTimeout
+        ) {
+            imageProxy.close()
+            return
+        }
+
+        val mediaImage = imageProxy.image
+
+        if (mediaImage == null) {
+            imageProxy.close()
+            return
+        }
+
+        processing = true
+        lastScanTime = now
+
+        val inputImage = InputImage.fromMediaImage(
+            mediaImage,
+            imageProxy.imageInfo.rotationDegrees
+        )
+
+        scanner.process(inputImage)
+            .addOnSuccessListener { barcodes ->
+                barcodes.firstOrNull {
+                    it.format == Barcode.FORMAT_QR_CODE &&
+                    !it.rawValue.isNullOrBlank()
+                }?.let { barcode ->
+
+                    val box = barcode.boundingBox
+
+                    emit(
+                        mapOf(
+                            "type" to "result",
+                            "value" to barcode.rawValue,
+                            "timestamp" to System.currentTimeMillis(),
+                            "left" to (box?.left ?: 0).toDouble(),
+                            "top" to (box?.top ?: 0).toDouble(),
+                            "width" to (box?.width() ?: 0).toDouble(),
+                            "height" to (box?.height() ?: 0).toDouble()
+                        )
+                    )
+                }
+            }
+            .addOnFailureListener {
+                emitError(it.message ?: "QR detection failed")
+            }
+            .addOnCompleteListener {
+                processing = false
+                imageProxy.close()
+            }
+    }
+
+    private fun emit(event: Map<String, Any?>) {
+        ContextCompat.getMainExecutor(context).execute {
+            eventSink?.success(event)
+        }
+    }
+
+    private fun emitError(message: String) {
+        emit(
+            mapOf(
+                "type" to "error",
+                "message" to message
+            )
+        )
+    }
+
+    private fun stopCamera() {
+        cameraProvider?.unbindAll()
+        camera = null
+        flashEnabled = false
+    }
+
+    override fun dispose() {
+        stopCamera()
+
+        methodChannel.setMethodCallHandler(null)
+        eventChannel.setStreamHandler(null)
+
+        analysisExecutor.shutdown()
+        scanner.close()
+    }
+}
+```
+
+Một lưu ý quan trọng về đoạn Android trên: `QrEngine` là nơi lưu `BinaryMessenger` và `Activity` của plugin. Cần bổ sung phần này vào plugin:
+
+```
+internal object QrEngine {
+    var messenger: io.flutter.plugin.common.BinaryMessenger? = null
+    var activity: Activity? = null
+}
+```
+
+Trong `onAttachedToEngine`:
+
+```
+QrEngine.messenger = binding.binaryMessenger
+```
+
+Trong các hàm `onAttachedToActivity` và `onReattachedToActivityForConfigChanges`:
+
+```
+QrEngine.activity = binding.activity
+```
+
+Khi detach thì gán `null`.
+
+Để triển khai production, cần bổ sung việc bind/unbind theo vòng đời Activity, xử lý quyền camera bị từ chối vĩnh viễn và xử lý việc chuyển camera khi không có camera trước.
+
+## 5. iOS native implementation
+
+iOS sẽ dùng `AVCaptureSession` để hiển thị camera và `Vision` để giải mã QR.
+
+Ưu điểm là không cần thêm ML Kit iOS hoặc SDK bên thứ ba.
+
+### 5.1. `ios/amio_qr_scanner.podspec`
+
+```
+Pod::Spec.new do |s|
+  s.name             = 'amio_qr_scanner'
+  s.version          = '1.0.0'
+  s.summary          = 'Native QR scanner for AMIO'
+  s.description      = 'Native QR scanner using AVFoundation and Vision'
+  s.homepage         = 'https://amio.vn'
+  s.license          = { :type => 'MIT' }
+  s.author           = { 'DGX' => 'tech@dgx.com.vn' }
+  s.source           = { :path => '.' }
+
+  s.source_files = 'Classes/**/*'
+  s.ios.deployment_target = '13.0'
+
+  s.swift_version = '5.0'
+  s.frameworks = 'AVFoundation', 'Vision', 'UIKit'
+end
+```
+
+### 5.2. `ios/Classes/AmioQrScannerPlugin.swift`
+
+```
+import Flutter
+import UIKit
+
+public class AmioQrScannerPlugin: NSObject, FlutterPlugin {
+
+    public static func register(
+        with registrar: FlutterPluginRegistrar
+    ) {
+        let factory = QrScannerViewFactory(
+            messenger: registrar.messenger()
+        )
+
+        registrar.register(
+            factory,
+            withId: "vn.com.dgx/amio_qr_scanner/view"
+        )
+    }
+}
+
+class QrScannerViewFactory: NSObject, FlutterPlatformViewFactory {
+
+    private let messenger: FlutterBinaryMessenger
+
+    init(messenger: FlutterBinaryMessenger) {
+        self.messenger = messenger
+        super.init()
+    }
+
+    func createArgsCodec() -> FlutterMessageCodec & NSObjectProtocol {
+        FlutterStandardMessageCodec.sharedInstance()
+    }
+
+    func create(
+        withFrame frame: CGRect,
+        viewIdentifier viewId: Int64,
+        arguments args: Any?
+    ) -> FlutterPlatformView {
+
+        return QrCameraManager(
+            frame: frame,
+            viewId: viewId,
+            messenger: messenger
+        )
+    }
+}
+```
+
+### 5.3. `ios/Classes/QrCameraManager.swift`
+
+```
+import AVFoundation
+import Vision
+import Flutter
+import UIKit
+
+final class QrCameraManager: NSObject,
+    FlutterPlatformView,
+    FlutterStreamHandler,
+    AVCaptureVideoDataOutputSampleBufferDelegate {
+
+    private let container: UIView
+
+    private let session = AVCaptureSession()
+    private let sessionQueue = DispatchQueue(
+        label: "vn.com.dgx.amio_qr_scanner.session"
+    )
+
+    private let detectionQueue = DispatchQueue(
+        label: "vn.com.dgx.amio_qr_scanner.detection"
+    )
+
+    private var previewLayer: AVCaptureVideoPreviewLayer?
+
+    private var videoInput: AVCaptureDeviceInput?
+    private var currentPosition: AVCaptureDevice.Position = .back
+
+    private var eventSink: FlutterEventSink?
+    private var isProcessing = false
+    private var isRunning = false
+    private var flashEnabled = false
+
+    private var lastDetectionTime = Date.distantPast
+    private var detectionTimeout: TimeInterval = 0.25
+
+    private let methodChannel: FlutterMethodChannel
+    private let eventChannel: FlutterEventChannel
+
+    init(
+        frame: CGRect,
+        viewId: Int64,
+        messenger: FlutterBinaryMessenger
+    ) {
+        container = UIView(frame: frame)
+
+        methodChannel = FlutterMethodChannel(
+            name: "vn.com.dgx/amio_qr_scanner/methods_\(viewId)",
+            binaryMessenger: messenger
+        )
+
+        eventChannel = FlutterEventChannel(
+            name: "vn.com.dgx/amio_qr_scanner/events_\(viewId)",
+            binaryMessenger: messenger
+        )
+
+        super.init()
+
+        methodChannel.setMethodCallHandler(handle)
+        eventChannel.setStreamHandler(self)
+
+        configurePreview()
+    }
+
+    func view() -> UIView {
+        return container
+    }
+
+    // MARK: - Channels
+
+    func onListen(
+        withArguments arguments: Any?,
+        eventSink events: @escaping FlutterEventSink
+    ) -> FlutterError? {
+        eventSink = events
+        return nil
+    }
+
+    func onCancel(
+        withArguments arguments: Any?
+    ) -> FlutterError? {
+        eventSink = nil
+        return nil
+    }
+
+    private func handle(
+        _ call: FlutterMethodCall,
+        result: @escaping FlutterResult
+    ) {
+        switch call.method {
+
+        case "requestPermission":
+            requestPermission(result)
+
+        case "start":
+            let args = call.arguments as? [String: Any] ?? [:]
+
+            detectionTimeout =
+                (args["detectionTimeout"] as? Double ?? 250) / 1000
+
+            let facing = args["cameraFacing"] as? String ?? "back"
+
+            currentPosition = facing == "front" ? .front : .back
+
+            start(result)
+
+        case "stop", "pause":
+            stop()
+            result(nil)
+
+        case "toggleFlash":
+            toggleFlash(result)
+
+        case "switchCamera":
+            switchCamera(result)
+
+        default:
+            result(FlutterMethodNotImplemented)
+        }
+    }
+
+    // MARK: - Permission
+
+    private func requestPermission(
+        _ result: @escaping FlutterResult
+    ) {
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+
+        case .authorized:
+            result(true)
+
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .video) { granted in
+                DispatchQueue.main.async {
+                    result(granted)
+                }
+            }
+
+        default:
+            result(false)
+        }
+    }
+
+    // MARK: - Preview
+
+    private func configurePreview() {
+        let layer = AVCaptureVideoPreviewLayer(session: session)
+
+        layer.videoGravity = .resizeAspectFill
+        layer.frame = container.bounds
+
+        container.layer.addSublayer(layer)
+
+        previewLayer = layer
+    }
+
+    // MARK: - Camera
+
+    private func start(
+        _ result: @escaping FlutterResult
+    ) {
+        guard AVCaptureDevice.authorizationStatus(for: .video)
+                == .authorized else {
+            result(
+                FlutterError(
+                    code: "PERMISSION_DENIED",
+                    message: "Camera permission denied",
+                    details: nil
+                )
+            )
+            return
+        }
+
+        sessionQueue.async {
+            do {
+                if self.session.inputs.isEmpty {
+                    try self.configureSession()
+                }
+
+                if !self.session.isRunning {
+                    self.session.startRunning()
+                }
+
+                self.isRunning = true
+
+                DispatchQueue.main.async {
+                    result(nil)
+                }
+
+            } catch {
+                DispatchQueue.main.async {
+                    result(
+                        FlutterError(
+                            code: "CAMERA_ERROR",
+                            message: error.localizedDescription,
+                            details: nil
+                        )
+                    )
+                }
+            }
+        }
+    }
+
+    private func configureSession() throws {
+        session.beginConfiguration()
+        session.sessionPreset = .high
+
+        defer {
+            session.commitConfiguration()
+        }
+
+        guard let device = AVCaptureDevice.default(
+            .builtInWideAngleCamera,
+            for: .video,
+            position: currentPosition
+        ) else {
+            throw NSError(
+                domain: "AmioQrScanner",
+                code: -1,
+                userInfo: [
+                    NSLocalizedDescriptionKey: "Camera unavailable"
+                ]
+            )
+        }
+
+        let input = try AVCaptureDeviceInput(device: device)
+
+        guard session.canAddInput(input) else {
+            throw NSError(
+                domain: "AmioQrScanner",
+                code: -2
+            )
+        }
+
+        session.addInput(input)
+        videoInput = input
+
+        let output = AVCaptureVideoDataOutput()
+
+        output.alwaysDiscardsLateVideoFrames = true
+
+        output.setSampleBufferDelegate(
+            self,
+            queue: detectionQueue
+        )
+
+        guard session.canAddOutput(output) else {
+            throw NSError(
+                domain: "AmioQrScanner",
+                code: -3
+            )
+        }
+
+        session.addOutput(output)
+    }
+
+    private func stop() {
+        sessionQueue.async {
+            if self.session.isRunning {
+                self.session.stopRunning()
+            }
+
+            self.isRunning = false
+            self.flashEnabled = false
+        }
+    }
+
+    // MARK: - QR Detection
+
+    func captureOutput(
+        _ output: AVCaptureOutput,
+        didOutput sampleBuffer: CMSampleBuffer,
+        from connection: AVCaptureConnection
+    ) {
+        guard isRunning, !isProcessing else {
+            return
+        }
+
+        let now = Date()
+
+        guard now.timeIntervalSince(lastDetectionTime)
+                >= detectionTimeout else {
+            return
+        }
+
+        isProcessing = true
+        lastDetectionTime = now
+
+        defer {
+            isProcessing = false
+        }
+
+        guard let pixelBuffer =
+                CMSampleBufferGetImageBuffer(sampleBuffer) else {
+            return
+        }
+
+        let request = VNDetectBarcodesRequest()
+
+        request.symbologies = [.qr]
+
+        let handler = VNImageRequestHandler(
+            cvPixelBuffer: pixelBuffer,
+            orientation: .right,
+            options: [:]
+        )
+
+        do {
+            try handler.perform([request])
+
+            guard let observation =
+                    request.results?.first,
+                  let value = observation.payloadStringValue,
+                  !value.isEmpty else {
+                return
+            }
+
+            let box = observation.boundingBox
+
+            emit([
+                "type": "result",
+                "value": value,
+                "timestamp": Int(Date().timeIntervalSince1970 * 1000),
+                "left": box.origin.x,
+                "top": 1 - box.origin.y - box.height,
+                "width": box.width,
+                "height": box.height
+            ])
+
+        } catch {
+            emit([
+                "type": "error",
+                "message": error.localizedDescription
+            ])
+        }
+    }
+
+    // MARK: - Flash
+
+    private func toggleFlash(
+        _ result: FlutterResult
+    ) {
+        guard let device = videoInput?.device,
+              device.hasTorch else {
+            result(false)
+            return
+        }
+
+        do {
+            try device.lockForConfiguration()
+
+            if device.torchMode == .on {
+                device.torchMode = .off
+                flashEnabled = false
+            } else {
+                try device.setTorchModeOn(level: 1.0)
+                flashEnabled = true
+            }
+
+            device.unlockForConfiguration()
+
+            result(flashEnabled)
+
+        } catch {
+            result(false)
+        }
+    }
+
+    // MARK: - Switch Camera
+
+    private func switchCamera(
+        _ result: FlutterResult
+    ) {
+        currentPosition =
+            currentPosition == .back ? .front : .back
+
+        sessionQueue.async {
+            self.session.beginConfiguration()
+
+            if let input = self.videoInput {
+                self.session.removeInput(input)
+            }
+
+            do {
+                guard let device = AVCaptureDevice.default(
+                    .builtInWideAngleCamera,
+                    for: .video,
+                    position: self.currentPosition
+                ) else {
+                    throw NSError(
+                        domain: "AmioQrScanner",
+                        code: -4
+                    )
+                }
+
+                let newInput = try AVCaptureDeviceInput(
+                    device: device
+                )
+
+                if self.session.canAddInput(newInput) {
+                    self.session.addInput(newInput)
+                    self.videoInput = newInput
+                }
+
+                self.session.commitConfiguration()
+
+                DispatchQueue.main.async {
+                    result(
+                        self.currentPosition == .front
+                            ? "front" : "back"
+                    )
+                }
+
+            } catch {
+                self.session.commitConfiguration()
+
+                DispatchQueue.main.async {
+                    result(
+                        FlutterError(
+                            code: "CAMERA_SWITCH_ERROR",
+                            message: error.localizedDescription,
+                            details: nil
+                        )
+                    )
+                }
+            }
+        }
+    }
+
+    // MARK: - Event
+
+    private func emit(_ data: [String: Any]) {
+        DispatchQueue.main.async {
+            self.eventSink?(data)
+        }
+    }
+
+    // MARK: - Layout
+
+    func updateFrame(_ frame: CGRect) {
+        container.frame = frame
+        previewLayer?.frame = container.bounds
+    }
+
+    deinit {
+        methodChannel.setMethodCallHandler(nil)
+        eventChannel.setStreamHandler(nil)
+
+        sessionQueue.async {
+            if self.session.isRunning {
+                self.session.stopRunning()
+            }
+        }
+    }
+}
+```
+
+### 5.4. iOS permission
+
+Thêm vào `ios/Runner/Info.plist` của AMIO:
+
+```
+<key>NSCameraUsageDescription</key>
+<string>AMIO cần quyền truy cập camera để quét mã QR.</string>
+```
+
+Không cần khai báo quyền đọc thư viện ảnh vì thư viện này không hỗ trợ quét ảnh từ gallery.
+
+## 6. Public API
+
+### `lib/amio_qr_scanner.dart`
+
+```
+library amio_qr_scanner;
+
+export 'src/controller/qr_scanner_controller.dart';
+
+export 'src/models/qr_scan_result.dart';
+export 'src/models/qr_scanner_config.dart';
+export 'src/models/qr_scanner_state.dart';
+
+export 'src/widgets/qr_scanner_view.dart';
+export 'src/widgets/qr_scanner_overlay.dart';
+```
+
+Các API công khai:
+
+| API                   | Chức năng                  |
+| --------------------- | -------------------------- |
+| `requestPermission()` | Yêu cầu quyền camera       |
+| `start()`             | Khởi động scanner          |
+| `stop()`              | Dừng camera                |
+| `pause()`             | Tạm dừng                   |
+| `resume()`            | Tiếp tục                   |
+| `toggleFlash()`       | Bật/tắt flash              |
+| `switchCamera()`      | Đổi camera                 |
+| `resetDetection()`    | Xóa trạng thái chống trùng |
+| `results`             | Stream kết quả QR          |
+| `state`               | Trạng thái scanner         |
+
+## 7. Ví dụ sử dụng trong AMIO
+
+### 7.1. Tích hợp package
+
+Trong `pubspec.yaml` của AMIO:
+
+```
+dependencies:
+  amio_qr_scanner:
+    path: ../amio_qr_scanner
+```
+
+Nếu package nằm trong Git:
+
+```
+dependencies:
+  amio_qr_scanner:
+    git:
+      url: https://github.com/dgx-com-vn/amio_qr_scanner.git
+      ref: main
+```
+
+Chạy:
+
+```
+flutter pub get
+```
+
+### 7.2. Tạo QR Scanner Page
+
+```
+import 'dart:async';
+
+import 'package:flutter/material.dart';
+import 'package:amio_qr_scanner/amio_qr_scanner.dart';
+
+class QRScannerPage extends StatefulWidget {
+  const QRScannerPage({super.key});
+
+  @override
+  State<QRScannerPage> createState() => _QRScannerPageState();
+}
+
+class _QRScannerPageState extends State<QRScannerPage> {
+  late final QrScannerController controller;
+
+  StreamSubscription<QRScanResult>? subscription;
+
+  bool initialized = false;
+  bool flashOn = false;
+
+  @override
+  void initState() {
+    super.initState();
+
+    controller = QrScannerController(
+      config: const QrScannerConfig(
+        cameraFacing: QrCameraFacing.back,
+        scanWindowSize: 260,
+        showOverlay: true,
+        showAnimation: true,
+        detectionTimeout: Duration(milliseconds: 250),
+        duplicateTimeout: Duration(seconds: 2),
+      ),
+    );
+
+    subscription = controller.results.listen(_onDetect);
+  }
+
+  void _onDetect(QRScanResult result) {
+    if (!mounted || !initialized) return;
+
+    initialized = false;
+
+    controller.pause();
+
+    Navigator.of(context).pop(result.value);
+  }
+
+  Future<void> _toggleFlash() async {
+    await controller.toggleFlash();
+
+    if (mounted) {
+      setState(() {
+        flashOn = controller.state.isFlashOn;
+      });
+    }
+  }
+
+  Future<void> _switchCamera() async {
+    await controller.switchCamera();
+
+    if (mounted) {
+      setState(() {
+        flashOn = false;
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    subscription?.cancel();
+    controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: SafeArea(
+        child: Stack(
+          children: [
+            QrScannerView(
+              controller: controller,
+              onDetect: _onDetect,
+            ),
+
+            Positioned(
+              top: 16,
+              left: 16,
+              right: 16,
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  IconButton(
+                    onPressed: () => Navigator.pop(context),
+                    icon: const Icon(
+                      Icons.close,
+                      color: Colors.white,
+                    ),
+                  ),
+                  const Text(
+                    'Quét mã QR',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 18,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  IconButton(
+                    onPressed: _toggleFlash,
+                    icon: Icon(
+                      flashOn
+                          ? Icons.flash_on
+                          : Icons.flash_off,
+                      color: Colors.white,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+
+            Positioned(
+              bottom: 32,
+              left: 0,
+              right: 0,
+              child: Center(
+                child: IconButton(
+                  onPressed: _switchCamera,
+                  icon: const Icon(
+                    Icons.cameraswitch,
+                    color: Colors.white,
+                    size: 32,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+```
+
+### 7.3. Mở QR Scanner từ AMIO
+
+```
+final qrCode = await Navigator.push<String>(
+  context,
+  MaterialPageRoute(
+    builder: (_) => const QRScannerPage(),
+  ),
+);
+
+if (qrCode != null) {
+  debugPrint('QR: $qrCode');
+
+  // Xử lý VietQR, deep link hoặc QR thanh toán.
+}
+```
+
+## 8. Các điểm bắt buộc phải hoàn thiện trước production
+
+Tôi muốn lưu ý một số vấn đề kỹ thuật trong source ở trên. Đây là bản thiết kế và implementation baseline, chưa phải package đã được build/test thành công trên thiết bị.
+
+| Hạng mục           | Việc cần làm                                                              |
+| ------------------ | ------------------------------------------------------------------------- |
+| Android Activity   | Hoàn thiện `QrEngine` và cập nhật Activity khi attach/detach              |
+| Android CameraX    | Đảm bảo Activity thực sự implement `LifecycleOwner`                       |
+| Android permission | Xử lý từ chối quyền và mở Settings                                        |
+| iOS orientation    | Xác định orientation thực tế từ camera connection, không cố định `.right` |
+| iOS preview        | Cập nhật `previewLayer.frame` khi widget thay đổi kích thước              |
+| Dart controller    | Sửa thứ tự stop trước khi đánh dấu disposed                               |
+| Flutter lifecycle  | Không tự động start khi chưa attach PlatformView                          |
+| Detection          | Chống trùng cả native và Dart, tránh callback sau khi đã đóng scanner     |
+| Scan window        | Hiện tại mới là overlay; chưa crop vùng nhận diện thực tế                 |
+
+Đặc biệt có hai chỗ trong Dart cần sửa:
+
+1\. `qr_scanner_state.dart` cần import config:
+
+```
+import 'qr_scanner_config.dart';
+```
+
+2\. `dispose()` phải dừng native camera trước khi đánh dấu disposed:
+
+```
+@override
+void dispose() {
+  if (_disposed) return;
+
+  _subscription?.cancel();
+
+  _invoke('stop');
+
+  _disposed = true;
+
+  _resultController.close();
+
+  super.dispose();
+}
+```
+
+Ngoài ra, `QrScannerView` phải giữ subscription của riêng widget và hủy khi dispose, tránh listener bị rò rỉ.
+
+3\. Cần thống nhất coordinate system. Android bounding box hiện là tọa độ pixel của ảnh phân tích, iOS là tọa độ normalized. Nếu muốn vẽ highlight QR trên camera preview, phải chuyển đổi theo rotation, aspect ratio và camera crop. Không thể dùng trực tiếp hai giá trị này như nhau.
+
+## 9. Cấu hình và kiểm thử
+
+Với AMIO hiện sử dụng Flutter 3.44.1 và Dart 3.12.1, có thể đặt cấu hình package:
+
+| Thành phần         | Cấu hình                    |
+| ------------------ | --------------------------- |
+| Dart               | 3.12+                       |
+| Flutter            | 3.44+                       |
+| Android minSdk     | 23                          |
+| Android compileSdk | 36                          |
+| Kotlin             | Theo phiên bản project AMIO |
+| iOS deployment     | 13.0                        |
+| Android camera     | CameraX                     |
+| Android decoder    | Bundled ML Kit              |
+| iOS decoder        | Vision                      |
+
+Các kịch bản test:
+
+- Camera permission lần đầu.
+- Permission bị từ chối.
+- Permission bị từ chối vĩnh viễn.
+- Quét QR VietQR.
+- Quét QR chứa tiếng Việt/Unicode.
+- QR xuất hiện liên tục không tạo callback trùng.
+- Bật/tắt flash.
+- Chuyển camera trước/sau.
+- Đưa app xuống background rồi quay lại.
+- Khóa/mở màn hình.
+- Thoát scanner khi camera đang hoạt động.
+- Mở scanner liên tục nhiều lần.
+- Kiểm thử trên Samsung, Xiaomi và Vivo.
+
+## 10. Đánh giá kiến trúc
+
+Tôi khuyến nghị giữ nguyên định hướng native độc lập này, nhưng có ba điều chỉnh trước khi đưa vào AMIO:
+
+1. Không truyền camera frame qua Flutter: native xử lý hoàn toàn, chỉ gửi QR string và metadata.
+2. Không để Flutter tự quyết định camera lifecycle độc lập: native phải là nguồn xác thực trạng thái camera.
+3. Không coi scan overlay là scan window: nếu yêu cầu chỉ nhận QR trong khung, phải triển khai ROI thực sự ở native.
+
+Tài liệu tham khảo:
+
+- [mobile_scanner – Flutter reference](https://pub.dev/packages/mobile_scanner?utm_source=chatgpt.com)
+- [Google ML Kit – Android](https://developers.google.com/ml-kit/vision/barcode-scanning/android?utm_source=chatgpt.com)
+- [Apple Vision – VNDetectBarcodesRequest](https://developer.apple.com/documentation/vision/vndetectbarcodesrequest?utm_source=chatgpt.com)
+- [Flutter Platform Channels](https://docs.flutter.dev/platform-integration/platform-channels?utm_source=chatgpt.com)
+- [Apple AVFoundation](https://developer.apple.com/documentation/avfoundation?utm_source=chatgpt.com)
+
+Kết luận: Đây là hướng triển khai đúng nếu mục tiêu là sở hữu scanner native của DGX, không phụ thuộc `mobile_scanner`. Tuy nhiên, chưa nên copy toàn bộ các đoạn code trên vào production trước khi hoàn thiện các điểm đã đánh dấu và build thử trên Android/iOS.
+
+Bước tiếp theo hợp lý là đóng gói thành repository `amio_qr_scanner` hoàn chỉnh, có example chạy được, test lifecycle và CI build Android/iOS.
