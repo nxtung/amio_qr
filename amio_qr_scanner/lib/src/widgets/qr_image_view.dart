@@ -132,6 +132,33 @@ class QrImageView extends StatefulWidget {
     );
   }
 
+  /// Tiện ích tĩnh: Tạo và lưu trực tiếp mã QR vào Thư viện ảnh (Gallery/Photos) của máy.
+  ///
+  /// Trả về `true` nếu lưu thành công, hoặc `false` nếu người dùng từ chối quyền.
+  static Future<bool> saveToGallery({
+    required String data,
+    int resolution = 1024,
+    int margin = 1,
+    QrErrorCorrectionLevel errorCorrectionLevel = QrErrorCorrectionLevel.medium,
+    Color codeColor = const Color(0xFF000000),
+    Color backgroundColor = const Color(0xFFFFFFFF),
+    String? fileName,
+  }) async {
+    final bytes = await toImageBytes(
+      data: data,
+      resolution: resolution,
+      margin: margin,
+      errorCorrectionLevel: errorCorrectionLevel,
+      codeColor: codeColor,
+      backgroundColor: backgroundColor,
+    );
+
+    return QrScannerPlatform.instance.saveImageToGallery(
+      bytes: bytes,
+      fileName: fileName,
+    );
+  }
+
   @override
   State<QrImageView> createState() => _QrImageViewState();
 }

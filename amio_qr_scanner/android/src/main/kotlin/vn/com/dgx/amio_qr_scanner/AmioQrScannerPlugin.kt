@@ -2,13 +2,17 @@ package vn.com.dgx.amio_qr_scanner
 
 import android.Manifest
 import android.app.Activity
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.net.Uri
-import android.provider.Settings
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.net.Uri
+import android.os.Build
+import android.os.Environment
+import android.provider.MediaStore
+import android.provider.Settings
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.google.mlkit.vision.barcode.BarcodeScannerOptions
@@ -148,7 +152,68 @@ class AmioQrScannerPlugin :
                 }
             }
 
+            "saveImageToGallery" -> {
+                val bytes = call.argument<ByteArray>("bytes")
+                if (bytes == null || bytes.isEmpty()) {
+                    result.error("INVALID_BYTES", "Image bytes cannot be empty", null)
+                    return
+                }
+                val fileName = call.argument<String>("fileName")
+                saveImageToGallery(bytes, fileName, result)
+            }
+
             else -> result.notImplemented()
+        }
+    }
+
+    private fun saveImageToGallery(
+        bytes: ByteArray,
+        fileName: String?,
+        result: MethodChannel.Result
+    ) {
+        val context = QrEngine.activity ?: QrEngine.appContext
+        if (context == null) {
+            result.error("NO_CONTEXT", "Application context is unavailable", null)
+            return
+        }
+
+        try {
+            val name = if (!fileName.isNullOrBlank()) {
+                if (fileName.endsWith(".png", ignoreCase = true)) fileName else "$fileName.png"
+            } else {
+                "qr_${System.currentTimeMillis()}.png"
+            }
+
+            val contentValues = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+                put(MediaStore.MediaColumns.MIME_TYPE, "image/png")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/AMIO_QR")
+                    put(MediaStore.MediaColumns.IS_PENDING, 1)
+                }
+            }
+
+            val resolver = context.contentResolver
+            val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
+            if (uri == null) {
+                result.error("SAVE_FAILED", "Failed to create MediaStore entry", null)
+                return
+            }
+
+            resolver.openOutputStream(uri)?.use { outputStream ->
+                outputStream.write(bytes)
+                outputStream.flush()
+            }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                contentValues.clear()
+                contentValues.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                resolver.update(uri, contentValues, null, null)
+            }
+
+            result.success(true)
+        } catch (e: Exception) {
+            result.error("SAVE_ERROR", e.localizedMessage ?: "Failed to save image to gallery", null)
         }
     }
 

@@ -35,6 +35,9 @@ void main() {
         }
         return fakePngBytes;
       }
+      if (call.method == 'saveImageToGallery') {
+        return true;
+      }
       return null;
     });
   });
@@ -77,6 +80,20 @@ void main() {
       expect(calls.length, 1);
       expect(calls.first.arguments['data'], 'https://amio.vn/test');
       expect(calls.first.arguments['width'], 256);
+    });
+
+    test('static QrImageView.saveToGallery generates and saves bytes', () async {
+      final success = await QrImageView.saveToGallery(
+        data: 'https://amio.vn/save',
+        resolution: 512,
+        fileName: 'custom_qr.png',
+      );
+
+      expect(success, isTrue);
+      expect(calls.length, 2);
+      expect(calls[0].method, 'generateQrImage');
+      expect(calls[1].method, 'saveImageToGallery');
+      expect(calls[1].arguments['fileName'], 'custom_qr.png');
     });
   });
 

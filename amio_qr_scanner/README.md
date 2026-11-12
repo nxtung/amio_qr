@@ -149,6 +149,13 @@ final Uint8List pngBytes = await QrImageView.toImageBytes(
   resolution: 512,
   codeColor: const Color(0xFFF26F25),
 );
+
+// 4. Lưu trực tiếp mã QR vào Thư viện ảnh (Gallery/Photos) của điện thoại:
+final bool success = await QrImageView.saveToGallery(
+  data: 'https://amio.vn',
+  resolution: 1024,
+  codeColor: const Color(0xFFF26F25),
+);
 ```
 
 ---
@@ -171,5 +178,6 @@ final Uint8List pngBytes = await QrImageView.toImageBytes(
 | `pickAndScanImage()` | Chọn ảnh từ Gallery và giải mã QR |
 | `QrImageView` | Widget render mã QR từ link/chuỗi bằng Native engine |
 | `QrImageView.toImageBytes()` | Tiện ích sinh mảng bytes PNG của mã QR |
+| `QrImageView.saveToGallery()` | Tạo và lưu mã QR thẳng vào Thư viện ảnh (Gallery/Photos) của máy |
 | `results` | `Stream<QRScanResult>` phát kết quả nhận diện |
 | `state` | Trạng thái hiện tại (`QrScannerState`) |

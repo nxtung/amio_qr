@@ -1,6 +1,7 @@
 import AVFoundation
 import CoreImage
 import Flutter
+import Photos
 import PhotosUI
 import UIKit
 import Vision
@@ -87,6 +88,20 @@ public class AmioQrScannerPlugin: NSObject,
                 bgColorNum: bgColorNum,
                 result: result
             )
+
+        case "saveImageToGallery":
+            guard let args = call.arguments as? [String: Any],
+                  let typedData = args["bytes"] as? FlutterStandardTypedData else {
+                result(
+                    FlutterError(
+                        code: "INVALID_BYTES",
+                        message: "Image bytes cannot be empty",
+                        details: nil
+                    )
+                )
+                return
+            }
+            saveImageToGallery(data: typedData.data, result: result)
 
         default:
             result(FlutterMethodNotImplemented)
@@ -474,6 +489,104 @@ extension AmioQrScannerPlugin {
         let g = CGFloat((num >> 8) & 0xFF) / 255.0
         let b = CGFloat(num & 0xFF) / 255.0
         return UIColor(red: r, green: g, blue: b, alpha: a)
+    }
+
+    private func saveImageToGallery(data: Data, result: @escaping FlutterResult) {
+        guard let image = UIImage(data: data) else {
+            result(
+                FlutterError(
+                    code: "INVALID_IMAGE",
+                    message: "Cannot decode image from bytes",
+                    details: nil
+                )
+            )
+            return
+        }
+
+        let performSave = {
+            PHPhotoLibrary.shared().performChanges({
+                PHAssetChangeRequest.creationRequestForAsset(from: image)
+            }) { success, error in
+                DispatchQueue.main.async {
+                    if success {
+                        result(true)
+                    } else {
+                        result(
+                            FlutterError(
+                                code: "SAVE_FAILED",
+                                message: error?.localizedDescription ?? "Failed to save image to photo library",
+                                details: nil
+                            )
+                        )
+                    }
+                }
+            }
+        }
+
+        let status: PHAuthorizationStatus
+        if #available(iOS 14.0, *) {
+            status = PHPhotoLibrary.authorizationStatus(for: .addOnly)
+        } else {
+            status = PHPhotoLibrary.authorizationStatus()
+        }
+
+        switch status {
+        case .authorized, .limited:
+            performSave()
+
+        case .notDetermined:
+            if #available(iOS 14.0, *) {
+                PHPhotoLibrary.requestAuthorization(for: .addOnly) { newStatus in
+                    if newStatus == .authorized || newStatus == .limited {
+                        performSave()
+                    } else {
+                        DispatchQueue.main.async {
+                            result(
+                                FlutterError(
+                                    code: "PERMISSION_DENIED",
+                                    message: "Photo library access denied",
+                                    details: nil
+                                )
+                            )
+                        }
+                    }
+                }
+            } else {
+                PHPhotoLibrary.requestAuthorization { newStatus in
+                    if newStatus == .authorized {
+                        performSave()
+                    } else {
+                        DispatchQueue.main.async {
+                            result(
+                                FlutterError(
+                                    code: "PERMISSION_DENIED",
+                                    message: "Photo library access denied",
+                                    details: nil
+                                )
+                            )
+                        }
+                    }
+                }
+            }
+
+        case .denied, .restricted:
+            result(
+                FlutterError(
+                    code: "PERMISSION_DENIED",
+                    message: "Photo library access denied",
+                    details: nil
+                )
+            )
+
+        @unknown default:
+            result(
+                FlutterError(
+                    code: "PERMISSION_DENIED",
+                    message: "Photo library access denied",
+                    details: nil
+                )
+            )
+        }
     }
 }
 

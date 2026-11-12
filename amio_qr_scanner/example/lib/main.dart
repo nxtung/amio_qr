@@ -453,11 +453,58 @@ class _QrGeneratorDemoPageState extends State<QrGeneratorDemoPage> {
 
   Color _selectedColor = const Color(0xFFF26F25);
   QrErrorCorrectionLevel _ecLevel = QrErrorCorrectionLevel.medium;
+  bool _isSaving = false;
 
   @override
   void dispose() {
     _urlController.dispose();
     super.dispose();
+  }
+
+  Future<void> _saveQrCode() async {
+    final text = _urlController.text.trim();
+    if (text.isEmpty) return;
+
+    setState(() => _isSaving = true);
+    try {
+      final success = await QrImageView.saveToGallery(
+        data: text,
+        resolution: 1024,
+        codeColor: _selectedColor,
+        errorCorrectionLevel: _ecLevel,
+        margin: 1,
+      );
+
+      if (!mounted) return;
+      if (success) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Đã lưu ảnh mã QR thành công vào Thư viện ảnh!'),
+            backgroundColor: Colors.green,
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Không thể lưu ảnh (Quyền truy cập bị từ chối)'),
+            backgroundColor: Colors.orange,
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Lỗi khi lưu ảnh: $e'),
+          backgroundColor: Colors.red,
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    } finally {
+      if (mounted) setState(() => _isSaving = false);
+    }
   }
 
   @override
@@ -588,6 +635,28 @@ class _QrGeneratorDemoPageState extends State<QrGeneratorDemoPage> {
                 color: Colors.black54,
               ),
               textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 24),
+            FilledButton.icon(
+              style: FilledButton.styleFrom(
+                padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
+                backgroundColor: const Color(0xFFF26F25),
+              ),
+              onPressed: (currentText.isEmpty || _isSaving) ? null : _saveQrCode,
+              icon: _isSaving
+                  ? const SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: Colors.white,
+                      ),
+                    )
+                  : const Icon(Icons.download_rounded),
+              label: Text(
+                _isSaving ? 'Đang lưu vào máy...' : 'Lưu ảnh QR vào Thư viện ảnh',
+                style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
+              ),
             ),
           ],
         ),

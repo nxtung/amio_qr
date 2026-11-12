@@ -105,4 +105,23 @@ class QrScannerPlatform {
 
     return bytes;
   }
+
+  /// Lưu mảng bytes ảnh PNG vào Thư viện ảnh (Gallery/Photos) của máy bằng Native Engine.
+  ///
+  /// - [bytes]: Mảng bytes ảnh PNG.
+  /// - [fileName]: Tên file tùy chọn (ví dụ: `my_qr.png`).
+  Future<bool> saveImageToGallery({
+    required Uint8List bytes,
+    String? fileName,
+  }) async {
+    assert(bytes.isNotEmpty, 'Image bytes cannot be empty');
+    final success = await _pluginChannel.invokeMethod<bool>(
+      'saveImageToGallery',
+      <String, dynamic>{
+        'bytes': bytes,
+        if (fileName != null) 'fileName': fileName,
+      },
+    );
+    return success ?? false;
+  }
 }

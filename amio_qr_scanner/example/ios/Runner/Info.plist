@@ -49,5 +49,7 @@
 	<string>Ứng dụng cần quyền truy cập Camera để quét mã QR.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Ứng dụng cần quyền truy cập Thư viện ảnh để chọn ảnh chứa mã QR.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>Ứng dụng cần quyền lưu ảnh mã QR vào Thư viện ảnh.</string>
 </dict>
 </plist>
