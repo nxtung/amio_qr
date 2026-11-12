@@ -45,6 +45,8 @@ dependencies:
 <string>Ứng dụng cần quyền truy cập Camera để quét mã QR.</string>
 <key>NSPhotoLibraryUsageDescription</key>
 <string>Ứng dụng cần quyền truy cập Thư viện ảnh để chọn ảnh chứa mã QR.</string>
+<key>NSPhotoLibraryAddUsageDescription</key>
+<string>Ứng dụng cần quyền lưu ảnh mã QR vào Thư viện ảnh.</string>
 ```
 
 *(Trên Android, quyền `android.permission.CAMERA` đã được khai báo sẵn trong `AndroidManifest.xml` của plugin).*
@@ -142,20 +144,68 @@ QrImageView(
   embeddedImage: const AssetImage('assets/images/logo.png'),
   embeddedImageSize: const Size(44, 44),
 )
+```
 
-// 3. Hoặc xuất trực tiếp mảng bytes PNG để lưu file / chia sẻ:
-final Uint8List pngBytes = await QrImageView.toImageBytes(
-  data: 'https://amio.vn',
-  resolution: 512,
-  codeColor: const Color(0xFFF26F25),
-);
+### Cách 5: Lưu ảnh mã QR về máy
 
-// 4. Lưu trực tiếp mã QR vào Thư viện ảnh (Gallery/Photos) của điện thoại:
+#### Phương án 1: Dùng hàm có sẵn trong plugin (`saveToGallery`)
+Thư viện cung cấp sẵn phương thức Native 1 dòng lệnh để lưu ảnh thẳng vào Bộ sưu tập / Album ảnh (MediaStore trên Android, Photos trên iOS) mà không cần cài thêm package nào:
+
+```dart
 final bool success = await QrImageView.saveToGallery(
   data: 'https://amio.vn',
-  resolution: 1024,
+  resolution: 1024, // Độ phân giải 1024x1024 sắc nét
   codeColor: const Color(0xFFF26F25),
+  fileName: 'amio_qr.png', // Tùy chọn tên file
 );
+
+if (success) {
+  debugPrint('Đã lưu ảnh QR vào Thư viện ảnh thành công!');
+}
+```
+
+#### Phương án 2: Dùng `toImageBytes` khi App đã có sẵn MethodChannel lưu ảnh
+Nếu ứng dụng chính đã có sẵn channel Native nhận `ByteArray` (hoặc `byte[]`), bạn chỉ cần sinh mảng bytes PNG qua `QrImageView.toImageBytes()` rồi truyền vào channel:
+
+```dart
+import 'package:flutter/services.dart';
+import 'package:amio_qr_scanner/amio_qr_scanner.dart';
+
+// Channel sẵn có trong dự án của bạn:
+const MethodChannel _appQrChannel = MethodChannel('YOUR_QR_CHANNEL');
+
+Future<void> saveQrViaAppChannel(String link) async {
+  // 1. Sinh mảng bytes PNG từ amio_qr_scanner
+  final Uint8List bytes = await QrImageView.toImageBytes(
+    data: link,
+    resolution: 1024,
+    codeColor: const Color(0xFFF26F25),
+    errorCorrectionLevel: QrErrorCorrectionLevel.high,
+  );
+
+  // 2. Đẩy trực tiếp bytes vào MethodChannel của App
+  // (StandardMessageCodec sẽ tự map Uint8List sang ByteArray trên Kotlin)
+  await _appQrChannel.invokeMethod('saveQrImage', bytes);
+}
+```
+
+*Phía Android (Kotlin) trong App của bạn nhận trực tiếp:*
+```kotlin
+MethodChannel(flutterEngine.dartExecutor.binaryMessenger, QR_CHANNEL)
+    .setMethodCallHandler { call, result ->
+        when (call.method) {
+            "saveQrImage" -> {
+                try {
+                    val bytes = call.arguments as ByteArray
+                    saveImageToGallery(bytes)
+                    result.success(null)
+                } catch (e: Exception) {
+                    result.error("SAVE_FAILED", e.message, null)
+                }
+            }
+            else -> result.notImplemented()
+        }
+    }
 ```
 
 ---
