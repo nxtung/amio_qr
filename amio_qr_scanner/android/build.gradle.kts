@@ -61,4 +61,7 @@ dependencies {
 
     // Bundled model: không cần tải model khi sử dụng lần đầu.
     implementation("com.google.mlkit:barcode-scanning:17.3.0")
+
+    // ZXing Core dùng tạo mã QR native.
+    implementation("com.google.zxing:core:3.5.3")
 }

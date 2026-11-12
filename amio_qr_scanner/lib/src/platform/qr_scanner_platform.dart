@@ -1,5 +1,6 @@
 import 'package:flutter/services.dart';
 
+import '../models/qr_error_correction_level.dart';
 import '../models/qr_scan_result.dart';
 import '../models/qr_scanner_config.dart';
 
@@ -62,5 +63,46 @@ class QrScannerPlatform {
     );
     if (map == null || map['value'] == null) return null;
     return QRScanResult.fromMap(map);
+  }
+
+  /// Tạo ảnh mã QR định dạng PNG bytes (`Uint8List`) từ đường link URL hoặc văn bản bất kỳ.
+  ///
+  /// - [data]: Dữ liệu link URL hoặc chuỗi bất kỳ cần mã hóa vào QR.
+  /// - [width], [height]: Kích thước pixel của ảnh tạo ra (mặc định 512x512).
+  /// - [margin]: Khoảng cách lề (quiet zone) tính theo module QR (mặc định 1).
+  /// - [errorCorrectionLevel]: Cấp độ sửa lỗi ([QrErrorCorrectionLevel.medium] mặc định).
+  /// - [codeColor]: Màu của các module mã QR (mặc định đen).
+  /// - [backgroundColor]: Màu nền ảnh QR (mặc định trắng).
+  Future<Uint8List> generateQrImage({
+    required String data,
+    int width = 512,
+    int height = 512,
+    int margin = 1,
+    QrErrorCorrectionLevel errorCorrectionLevel = QrErrorCorrectionLevel.medium,
+    Color codeColor = const Color(0xFF000000),
+    Color backgroundColor = const Color(0xFFFFFFFF),
+  }) async {
+    assert(data.isNotEmpty, 'QR data cannot be empty');
+    final bytes = await _pluginChannel.invokeMethod<Uint8List>(
+      'generateQrImage',
+      <String, dynamic>{
+        'data': data,
+        'width': width,
+        'height': height,
+        'margin': margin,
+        'errorCorrectionLevel': errorCorrectionLevel.value,
+        'codeColor': codeColor.toARGB32(),
+        'backgroundColor': backgroundColor.toARGB32(),
+      },
+    );
+
+    if (bytes == null || bytes.isEmpty) {
+      throw PlatformException(
+        code: 'GENERATE_FAILED',
+        message: 'Native plugin returned null or empty bytes for QR code',
+      );
+    }
+
+    return bytes;
   }
 }

@@ -57,6 +57,37 @@ public class AmioQrScannerPlugin: NSObject,
         case "pickAndScanImage":
             pickAndScanImage(result: result)
 
+        case "generateQrImage":
+            guard let args = call.arguments as? [String: Any],
+                  let data = args["data"] as? String,
+                  !data.isEmpty else {
+                result(
+                    FlutterError(
+                        code: "INVALID_DATA",
+                        message: "QR data cannot be empty",
+                        details: nil
+                    )
+                )
+                return
+            }
+            let width = args["width"] as? Int ?? 512
+            let height = args["height"] as? Int ?? 512
+            let margin = args["margin"] as? Int ?? 1
+            let ecLevel = args["errorCorrectionLevel"] as? String ?? "M"
+            let codeColorNum = args["codeColor"] as? NSNumber
+            let bgColorNum = args["backgroundColor"] as? NSNumber
+
+            generateQrImage(
+                data: data,
+                width: width,
+                height: height,
+                margin: margin,
+                ecLevel: ecLevel,
+                codeColorNum: codeColorNum,
+                bgColorNum: bgColorNum,
+                result: result
+            )
+
         default:
             result(FlutterMethodNotImplemented)
         }
@@ -279,6 +310,170 @@ extension AmioQrScannerPlugin: PHPickerViewControllerDelegate {
             }
             self.decodeQrFromUIImage(image, result: pending)
         }
+    }
+}
+
+// MARK: - QR Code Generation
+extension AmioQrScannerPlugin {
+
+    private func generateQrImage(
+        data: String,
+        width: Int,
+        height: Int,
+        margin: Int,
+        ecLevel: String,
+        codeColorNum: NSNumber?,
+        bgColorNum: NSNumber?,
+        result: @escaping FlutterResult
+    ) {
+        guard let qrFilter = CIFilter(name: "CIQRCodeGenerator") else {
+            result(
+                FlutterError(
+                    code: "FILTER_ERROR",
+                    message: "CIQRCodeGenerator is not available",
+                    details: nil
+                )
+            )
+            return
+        }
+        guard let dataBytes = data.data(using: .utf8) else {
+            result(
+                FlutterError(
+                    code: "ENCODING_ERROR",
+                    message: "Cannot encode data to UTF-8",
+                    details: nil
+                )
+            )
+            return
+        }
+
+        qrFilter.setValue(dataBytes, forKey: "inputMessage")
+        let validEc: String
+        switch ecLevel.uppercased() {
+        case "L", "Q", "H": validEc = ecLevel.uppercased()
+        default: validEc = "M"
+        }
+        qrFilter.setValue(validEc, forKey: "inputCorrectionLevel")
+
+        guard let rawCiImage = qrFilter.outputImage else {
+            result(
+                FlutterError(
+                    code: "GENERATION_ERROR",
+                    message: "Failed to generate QR output image",
+                    details: nil
+                )
+            )
+            return
+        }
+
+        let codeColor = colorFromNumber(codeColorNum, defaultColor: .black)
+        let bgColor = colorFromNumber(bgColorNum, defaultColor: .white)
+
+        let colorFilter = CIFilter(name: "CIFalseColor")
+        colorFilter?.setValue(rawCiImage, forKey: "inputImage")
+        colorFilter?.setValue(CIColor(color: codeColor), forKey: "inputColor0")
+        colorFilter?.setValue(CIColor(color: bgColor), forKey: "inputColor1")
+
+        guard let coloredImage = colorFilter?.outputImage else {
+            result(
+                FlutterError(
+                    code: "COLOR_ERROR",
+                    message: "Failed to apply color filter",
+                    details: nil
+                )
+            )
+            return
+        }
+
+        let extent = coloredImage.extent
+        let modWidth = extent.width
+        let modHeight = extent.height
+        let totalWidth = modWidth + CGFloat(margin * 2)
+        let totalHeight = modHeight + CGFloat(margin * 2)
+
+        let scaleX = CGFloat(width) / totalWidth
+        let scaleY = CGFloat(height) / totalHeight
+        let scale = min(scaleX, scaleY)
+
+        let context = CIContext(options: [CIContextOption.useSoftwareRenderer: false])
+        guard let cgImage = context.createCGImage(coloredImage, from: extent) else {
+            result(
+                FlutterError(
+                    code: "RENDER_ERROR",
+                    message: "Failed to create CGImage",
+                    details: nil
+                )
+            )
+            return
+        }
+
+        let targetW = max(1, Int(totalWidth * scale))
+        let targetH = max(1, Int(totalHeight * scale))
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let bitmapContext = CGContext(
+            data: nil,
+            width: targetW,
+            height: targetH,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            result(
+                FlutterError(
+                    code: "BITMAP_ERROR",
+                    message: "Failed to create CGContext",
+                    details: nil
+                )
+            )
+            return
+        }
+
+        bitmapContext.interpolationQuality = .none
+        bitmapContext.setFillColor(bgColor.cgColor)
+        bitmapContext.fill(CGRect(x: 0, y: 0, width: targetW, height: targetH))
+
+        let qrDrawRect = CGRect(
+            x: CGFloat(margin) * scale,
+            y: CGFloat(margin) * scale,
+            width: modWidth * scale,
+            height: modHeight * scale
+        )
+        bitmapContext.draw(cgImage, in: qrDrawRect)
+
+        guard let finalCgImage = bitmapContext.makeImage() else {
+            result(
+                FlutterError(
+                    code: "FINAL_IMAGE_ERROR",
+                    message: "Failed to finalize QR image",
+                    details: nil
+                )
+            )
+            return
+        }
+
+        let finalUiImage = UIImage(cgImage: finalCgImage)
+        guard let pngData = finalUiImage.pngData() else {
+            result(
+                FlutterError(
+                    code: "PNG_ERROR",
+                    message: "Failed to encode PNG data",
+                    details: nil
+                )
+            )
+            return
+        }
+
+        result(FlutterStandardTypedData(bytes: pngData))
+    }
+
+    private func colorFromNumber(_ number: NSNumber?, defaultColor: UIColor) -> UIColor {
+        guard let num = number?.int64Value else { return defaultColor }
+        let a = CGFloat((num >> 24) & 0xFF) / 255.0
+        let r = CGFloat((num >> 16) & 0xFF) / 255.0
+        let g = CGFloat((num >> 8) & 0xFF) / 255.0
+        let b = CGFloat(num & 0xFF) / 255.0
+        return UIColor(red: r, green: g, blue: b, alpha: a)
     }
 }
 

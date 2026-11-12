@@ -165,6 +165,20 @@ class _HomePageState extends State<HomePage> {
               icon: const Icon(Icons.photo_library_outlined),
               label: const Text('Quét QR trực tiếp từ Thư viện ảnh'),
             ),
+            const Divider(height: 32),
+            FilledButton.icon(
+              style: FilledButton.styleFrom(
+                backgroundColor: const Color(0xFFF26F25),
+                foregroundColor: Colors.white,
+              ),
+              onPressed: () {
+                Navigator.of(context).push(
+                  MaterialPageRoute(builder: (_) => const QrGeneratorDemoPage()),
+                );
+              },
+              icon: const Icon(Icons.qr_code_2),
+              label: const Text('Tạo mã QR từ link bất kỳ (QrImageView)'),
+            ),
           ],
         ),
       ),
@@ -418,6 +432,164 @@ class _CustomScannerPageState extends State<CustomScannerPage> {
               ],
             );
           },
+        ),
+      ),
+    );
+  }
+}
+
+/// Màn hình thử nghiệm tạo mã QR từ link/văn bản bất kỳ bằng `QrImageView`.
+class QrGeneratorDemoPage extends StatefulWidget {
+  const QrGeneratorDemoPage({super.key});
+
+  @override
+  State<QrGeneratorDemoPage> createState() => _QrGeneratorDemoPageState();
+}
+
+class _QrGeneratorDemoPageState extends State<QrGeneratorDemoPage> {
+  final TextEditingController _urlController = TextEditingController(
+    text: 'https://amio.vn',
+  );
+
+  Color _selectedColor = const Color(0xFFF26F25);
+  QrErrorCorrectionLevel _ecLevel = QrErrorCorrectionLevel.medium;
+
+  @override
+  void dispose() {
+    _urlController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final currentText = _urlController.text.trim();
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Tạo mã QR từ Link (Native)'),
+      ),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          children: [
+            TextField(
+              controller: _urlController,
+              decoration: InputDecoration(
+                labelText: 'Nhập đường link hoặc nội dung',
+                hintText: 'https://...',
+                prefixIcon: const Icon(Icons.link),
+                suffixIcon: IconButton(
+                  icon: const Icon(Icons.clear),
+                  onPressed: () {
+                    _urlController.clear();
+                    setState(() {});
+                  },
+                ),
+                border: const OutlineInputBorder(),
+              ),
+              onChanged: (_) => setState(() {}),
+            ),
+            const SizedBox(height: 16),
+            Row(
+              children: [
+                const Text(
+                  'Màu mã QR: ',
+                  style: TextStyle(fontWeight: FontWeight.w600),
+                ),
+                const SizedBox(width: 8),
+                for (final color in [
+                  const Color(0xFFF26F25),
+                  const Color(0xFF000000),
+                  const Color(0xFF0D47A1),
+                  const Color(0xFF1B5E20),
+                ])
+                  GestureDetector(
+                    onTap: () => setState(() => _selectedColor = color),
+                    child: Container(
+                      margin: const EdgeInsets.symmetric(horizontal: 4),
+                      width: 32,
+                      height: 32,
+                      decoration: BoxDecoration(
+                        color: color,
+                        shape: BoxShape.circle,
+                        border: Border.all(
+                          color: _selectedColor == color
+                              ? Colors.black87
+                              : Colors.transparent,
+                          width: 2.5,
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                const Text(
+                  'Mức sửa lỗi: ',
+                  style: TextStyle(fontWeight: FontWeight.w600),
+                ),
+                const SizedBox(width: 8),
+                DropdownButton<QrErrorCorrectionLevel>(
+                  value: _ecLevel,
+                  items: QrErrorCorrectionLevel.values.map((level) {
+                    return DropdownMenuItem(
+                      value: level,
+                      child: Text('Level ${level.value} (${level.name})'),
+                    );
+                  }).toList(),
+                  onChanged: (newVal) {
+                    if (newVal != null) setState(() => _ecLevel = newVal);
+                  },
+                ),
+              ],
+            ),
+            const SizedBox(height: 24),
+            Container(
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(16),
+                boxShadow: const [
+                  BoxShadow(
+                    color: Color(0x15000000),
+                    blurRadius: 10,
+                    offset: Offset(0, 4),
+                  ),
+                ],
+              ),
+              child: currentText.isEmpty
+                  ? const SizedBox(
+                      width: 220,
+                      height: 220,
+                      child: Center(
+                        child: Text(
+                          'Vui lòng nhập link để tạo mã QR',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(color: Colors.grey),
+                        ),
+                      ),
+                    )
+                  : QrImageView(
+                      data: currentText,
+                      size: 220,
+                      codeColor: _selectedColor,
+                      errorCorrectionLevel: _ecLevel,
+                      margin: 1,
+                    ),
+            ),
+            const SizedBox(height: 16),
+            Text(
+              'Widget: QrImageView(data: "${currentText.isEmpty ? '...' : currentText}")',
+              style: const TextStyle(
+                fontFamily: 'monospace',
+                fontSize: 12,
+                color: Colors.black54,
+              ),
+              textAlign: TextAlign.center,
+            ),
+          ],
         ),
       ),
     );

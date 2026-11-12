@@ -13,6 +13,7 @@ Thư viện Flutter Plugin quét mã QR Native độc lập dùng chung cho hệ
   - Chuẩn hóa hệ tọa độ Bounding Box (`0.0 - 1.0`) đồng nhất giữa Android và iOS.
   - Kiểm tra và yêu cầu quyền Camera chi tiết (`granted`, `denied`, `permanentlyDenied`, `restricted`) kèm hàm `openAppSettings()`.
   - Hỗ trợ **quét mã QR từ ảnh tĩnh / Thư viện ảnh (Gallery)** bằng System Picker native không cần cài thêm package ngoài.
+  - Hỗ trợ **tạo mã QR (QR Generator)** từ đường link (URL) hoặc chuỗi bất kỳ bằng engine Native (ZXing trên Android, CoreImage trên iOS), render trực tiếp ra widget `QrImageView` sắc nét, có cache và tùy biến màu sắc, logo.
   - Cung cấp sẵn `QrScannerScreen` (Default UI) và `QrScannerView` + `QrScannerOverlay` để tuỳ biến linh hoạt.
 
 ---
@@ -121,6 +122,35 @@ final result = await controller.pickAndScanImage();
 final fileResult = await controller.scanImagePath('/path/to/qr_image.png');
 ```
 
+### Cách 4: Tạo mã QR từ link bất kỳ và render ra Widget (`QrImageView`)
+
+```dart
+import 'package:amio_qr_scanner/amio_qr_scanner.dart';
+
+// 1. Tạo widget mã QR cơ bản từ link URL:
+QrImageView(
+  data: 'https://amio.vn',
+  size: 200,
+)
+
+// 2. Tùy biến màu sắc, mức sửa lỗi và nhúng Logo ở giữa:
+QrImageView(
+  data: 'https://amio.vn/pay/order_123',
+  size: 240,
+  codeColor: const Color(0xFFF26F25), // Màu cam thương hiệu
+  errorCorrectionLevel: QrErrorCorrectionLevel.high,
+  embeddedImage: const AssetImage('assets/images/logo.png'),
+  embeddedImageSize: const Size(44, 44),
+)
+
+// 3. Hoặc xuất trực tiếp mảng bytes PNG để lưu file / chia sẻ:
+final Uint8List pngBytes = await QrImageView.toImageBytes(
+  data: 'https://amio.vn',
+  resolution: 512,
+  codeColor: const Color(0xFFF26F25),
+);
+```
+
 ---
 
 ## 3. Danh sách Public API
@@ -139,5 +169,7 @@ final fileResult = await controller.scanImagePath('/path/to/qr_image.png');
 | `resetDetection()` | Xóa bộ nhớ chống trùng lặp mã QR |
 | `scanImagePath(path)` | Quét mã QR từ đường dẫn file ảnh |
 | `pickAndScanImage()` | Chọn ảnh từ Gallery và giải mã QR |
+| `QrImageView` | Widget render mã QR từ link/chuỗi bằng Native engine |
+| `QrImageView.toImageBytes()` | Tiện ích sinh mảng bytes PNG của mã QR |
 | `results` | `Stream<QRScanResult>` phát kết quả nhận diện |
 | `state` | Trạng thái hiện tại (`QrScannerState`) |

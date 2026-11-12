@@ -7,12 +7,18 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.provider.Settings
+import android.graphics.Bitmap
+import android.graphics.Color
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.google.mlkit.vision.barcode.BarcodeScannerOptions
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.EncodeHintType
+import com.google.zxing.qrcode.QRCodeWriter
+import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.embedding.engine.plugins.activity.ActivityAware
 import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
@@ -23,7 +29,9 @@ import io.flutter.plugin.common.PluginRegistry
 import io.flutter.plugin.common.StandardMessageCodec
 import io.flutter.plugin.platform.PlatformView
 import io.flutter.plugin.platform.PlatformViewFactory
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.util.EnumMap
 
 internal object QrEngine {
     var messenger: BinaryMessenger? = null
@@ -107,8 +115,82 @@ class AmioQrScannerPlugin :
                 pickImageFromGallery(result)
             }
 
+            "generateQrImage" -> {
+                val data = call.argument<String>("data")
+                if (data.isNullOrEmpty()) {
+                    result.error("INVALID_DATA", "QR data cannot be empty", null)
+                    return
+                }
+                val width = call.argument<Int>("width") ?: 512
+                val height = call.argument<Int>("height") ?: 512
+                val margin = call.argument<Int>("margin") ?: 1
+                val ecLevel = call.argument<String>("errorCorrectionLevel") ?: "M"
+                val codeColor = (call.argument<Number>("codeColor")?.toLong() ?: 0xFF000000L).toInt()
+                val backgroundColor = (call.argument<Number>("backgroundColor")?.toLong() ?: 0xFFFFFFFFL).toInt()
+
+                try {
+                    val bytes = generateQrPngBytes(
+                        data = data,
+                        width = width,
+                        height = height,
+                        margin = margin,
+                        ecLevel = ecLevel,
+                        codeColor = codeColor,
+                        backgroundColor = backgroundColor
+                    )
+                    result.success(bytes)
+                } catch (e: Exception) {
+                    result.error(
+                        "GENERATE_ERROR",
+                        e.localizedMessage ?: "Failed to generate QR code image",
+                        null
+                    )
+                }
+            }
+
             else -> result.notImplemented()
         }
+    }
+
+    private fun generateQrPngBytes(
+        data: String,
+        width: Int,
+        height: Int,
+        margin: Int,
+        ecLevel: String,
+        codeColor: Int,
+        backgroundColor: Int
+    ): ByteArray {
+        val hints = EnumMap<EncodeHintType, Any>(EncodeHintType::class.java).apply {
+            put(EncodeHintType.CHARACTER_SET, "UTF-8")
+            put(EncodeHintType.MARGIN, margin)
+            val level = when (ecLevel.uppercase()) {
+                "L" -> ErrorCorrectionLevel.L
+                "Q" -> ErrorCorrectionLevel.Q
+                "H" -> ErrorCorrectionLevel.H
+                else -> ErrorCorrectionLevel.M
+            }
+            put(EncodeHintType.ERROR_CORRECTION, level)
+        }
+
+        val bitMatrix = QRCodeWriter().encode(data, BarcodeFormat.QR_CODE, width, height, hints)
+        val matrixWidth = bitMatrix.width
+        val matrixHeight = bitMatrix.height
+        val pixels = IntArray(matrixWidth * matrixHeight)
+
+        for (y in 0 until matrixHeight) {
+            val offset = y * matrixWidth
+            for (x in 0 until matrixWidth) {
+                pixels[offset + x] = if (bitMatrix.get(x, y)) codeColor else backgroundColor
+            }
+        }
+
+        val bitmap = Bitmap.createBitmap(matrixWidth, matrixHeight, Bitmap.Config.ARGB_8888)
+        bitmap.setPixels(pixels, 0, matrixWidth, 0, 0, matrixWidth, matrixHeight)
+
+        val outputStream = ByteArrayOutputStream()
+        bitmap.compress(Bitmap.CompressFormat.PNG, 100, outputStream)
+        return outputStream.toByteArray()
     }
 
     private fun getCurrentPermissionStatus(): String {
